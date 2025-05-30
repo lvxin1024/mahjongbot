@@ -33,8 +33,7 @@ class cards(Enum):
     # 箭牌
     J = 4
 class requests(Enum):
-    initialHand = 1
-    drawCard = 2
+    BUHUA = 0
     DRAW = 4
     PLAY = 5
     PENG = 6
@@ -65,7 +64,7 @@ class Mymodel_action(nn.Module):
 
         # ResNet block
         self.resnet = nn.Sequential(
-            nn.Conv2d(4, 512, kernel_size=1),
+            nn.Conv2d(117, 512, kernel_size=1),
             nn.BatchNorm2d(512),
             nn.ReLU(inplace=True),
             nn.Conv2d(512, 128, kernel_size=1),
@@ -100,7 +99,7 @@ class Mymodel_action(nn.Module):
             nn.Conv2d(128, 128, kernel_size=3, padding=1),
             nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
-            nn.Conv2d(128, 512, kernel_size=3, padding=1),
+            nn.Conv2d(128, 512, kernel_size=1),
             nn.BatchNorm2d(512),
             nn.ReLU(inplace=True)
         )
@@ -113,14 +112,12 @@ class Mymodel_action(nn.Module):
             nn.Conv2d(128, 128, kernel_size=3, padding=1),
             nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
-            nn.Conv2d(128, 512, kernel_size=1),
-            nn.BatchNorm2d(512),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(512, 64, kernel_size=1),
+            nn.Conv2d(128, 64, kernel_size=1),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d((1, 1)),
             nn.Flatten(),
-            nn.Linear(64 * 9 * 184, 234)  # Replace 10 with the number of output classes
+            nn.Linear(64, 235)  # Replace 10 with the number of output classes
         )
 
     def mask_actions(actions, valid_actions):
@@ -133,11 +130,19 @@ class Mymodel_action(nn.Module):
         return masked_actions
 
     def forward(self, x,mask):
+        if x.dim() == 3:
+            x = x.unsqueeze(0)  # 添加批次维度
+        if mask.dim() == 1:
+            mask = mask.unsqueeze(0)  # 添加批次维度
+            
+        # 调整通道顺序 (H, W, C) -> (C, H, W)
+        # x = x.permute(0, 3, 1, 2)
         out_resnet = self.resnet(x)
         out_concat1 = self.concat1(out_resnet)
         out_concat2 = self.concat2(torch.cat([out_resnet, out_concat1], dim=1))
         out_output = self.output(torch.cat([out_concat2, out_concat1], dim=1))
-        return out_output
+        masked_output = out_output * mask  # 将非法动作的概率设为0
+        return F.softmax(masked_output, dim=-1)
 
 
 class Mymodel_value(nn.Module):
@@ -146,7 +151,7 @@ class Mymodel_value(nn.Module):
 
         # ResNet block
         self.resnet = nn.Sequential(
-            nn.Conv2d(4, 512, kernel_size=1),
+            nn.Conv2d(117, 512, kernel_size=1),
             nn.BatchNorm2d(512),
             nn.ReLU(inplace=True),
             nn.Conv2d(512, 128, kernel_size=1),
@@ -194,17 +199,17 @@ class Mymodel_value(nn.Module):
             nn.Conv2d(128, 128, kernel_size=3, padding=1),
             nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
-            nn.Conv2d(128, 512, kernel_size=1),
-            nn.BatchNorm2d(512),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(512, 64, kernel_size=1),
+            nn.Conv2d(128, 64, kernel_size=1),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d((1, 1)),
             nn.Flatten(),
-            nn.Linear(64 * 9 * 184, 1)  # Replace 10 with the number of output classes
+            nn.Linear(64, 1)
         )
 
     def forward(self, x):
+        if x.dim() == 3:
+            x = x.unsqueeze(0)  # 添加批次维度
         out_resnet = self.resnet(x)
         out_concat1 = self.concat1(out_resnet)
         out_concat2 = self.concat2(torch.cat([out_resnet, out_concat1], dim=1))
@@ -319,7 +324,8 @@ class MahjonggMemory:
         return [(np.array(self.states)[batch], np.array(self.actions)[batch],
                  np.array(self.rewards)[batch], np.array(self.dones)[batch]) for batch in batches]
 
-
+from tqdm import tqdm
+import time
 
 
 # 定义Off-policy PPO算法
@@ -327,100 +333,189 @@ class OffPolicyPPO:
     def __init__(self,  lr=3e-4, gamma=0.99, clip_ratio=0.2, entropy_coef=0.01):
         self.policy = Mymodel_action()
         self.value=Mymodel_value()
-        self.optimizer = optim.Adam(self.policy.parameters(), lr=lr)
+        self.optimizer_policy = optim.Adam(self.policy.parameters(), lr=lr)
+        self.optimizer_value = optim.Adam(self.value.parameters(), lr=lr)
         self.gamma = gamma
         self.clip_ratio = clip_ratio
         self.entropy_coef = entropy_coef
 
-    def train_step(self, states, actions, old_log_probs, returns, advantages, weights):
+    def train_step(self, states, actions, old_log_probs, returns, advantages, masks):
         # 计算策略函数的新的概率分布
-        policy = self.policy(torch.FloatTensor(states))
-        values=self.value(torch.FloatTensor(states))
-        log_probs = torch.log(policy.gather(1, torch.LongTensor(actions).unsqueeze(-1)))
+        states_tensor = torch.FloatTensor(np.array(states))
+        masks_tensor = torch.FloatTensor(np.array(masks))
+        policy_output = self.policy(states_tensor, masks_tensor)
+        log_probs = torch.log(policy_output.gather(1, torch.LongTensor(actions).unsqueeze(-1)))
         ratios = torch.exp(log_probs - old_log_probs.detach())
 
-        # 计算比率裁剪
-        surr1 = ratios * advantages
-        surr2 = torch.clamp(ratios, 1 - self.clip_ratio, 1 + self.clip_ratio) * advantages
-        policy_loss = -torch.min(surr1, surr2).mean()
-
-        # 计算值函数的损失
-        value_loss = nn.MSELoss(reduction='none')(values, torch.FloatTensor(returns))
-        value_loss = (value_loss * weights).mean()
+        clipped_ratios = torch.clamp(ratios, 1 - self.clip_ratio, 1 + self.clip_ratio)
+        
+        policy_loss = -torch.min(ratios * advantages, clipped_ratios * advantages).mean()
+        
+        # 更新价值网络
+        values = self.value(torch.FloatTensor(states))
+        value_loss = F.mse_loss(values.squeeze(), torch.FloatTensor(returns))
 
         # 计算熵的损失
-        entropy_loss = -(policy * torch.log(policy + 1e-8)).sum(dim=-1).mean()
+        entropy_loss = -(policy_output * torch.log(policy_output + 1e-8)).sum(dim=-1).mean()
 
-        # 计算总损失并进行反向传播和优化
-        loss = policy_loss + 0.5 * value_loss - self.entropy_coef * entropy_loss
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
+        # 更新策略
+        self.optimizer_policy.zero_grad()
+        (-self.entropy_coef * entropy_loss + policy_loss).backward(retain_graph=True)
+        self.optimizer_policy.step()
+        
+        # 更新价值
+        self.optimizer_value.zero_grad()
+        value_loss.backward()
+        self.optimizer_value.step()
 
     def train(self, env, num_episodes, max_steps, batch_size=32, buffer_size=10000):
-        state_dim = env.observation_space.shape[0]
-        action_dim = env.action_space.n
+        # state_dim = env.observation_space.shape[0]
+        # action_dim = env.action_space.n
+        episode_transitions = []
         replay_buffer = []
+        
+        progress_bar = tqdm(range(num_episodes), desc="Training Progress")
+        running_reward = 0
+        running_length = 0
+        best_reward = float('-inf')
+
         for episode in range(num_episodes):
+            episode_start = time.time()
             state = env.reset()
             done = False
             episode_reward = 0
             t = 0
             while not done and t < max_steps:
-                policy = Mymodel_action()
-                values = Mymodel_value()
-                #######################
-                action = torch.argmax(policy).item()
-                ##########################
-                log_prob = torch.log(policy[action])
+                state_tensor = torch.FloatTensor(state).unsqueeze(0)  # Shape: (1, 117, 4, 9)
+                # 调用 build_available_action_mask 生成动作掩码
+                action_mask, _ = env.build_available_action_mask(state)
+                mask_tensor = torch.FloatTensor(action_mask).unsqueeze(0)
 
+                # # 获取模型输出
+                # policy_output = self.policy(
+                #     torch.FloatTensor(state).unsqueeze(0), 
+                #     torch.FloatTensor(actionmask).unsqueeze(0)
+                # )
+                # action = torch.argmax(policy_output).item()  # 对模型输出调用 argmax
+                
+                # log_prob = torch.log(policy_output[0, action])  # 获取对应动作的 log 概率
 
+                # next_state, reward, done, _ = env.step(action)
+                # episode_reward += reward
+                # replay_buffer.append((state, action, log_prob, reward, next_state, done))
+                # if len(replay_buffer) > buffer_size:
+                #     replay_buffer.pop(0)
 
+                # 使用采样而非argmax进行探索
+                with torch.no_grad():
+                    state_tensor = torch.FloatTensor(state).unsqueeze(0)
+                    mask_tensor = torch.FloatTensor(action_mask).unsqueeze(0)
+                    policy_output = self.policy(state_tensor, mask_tensor)
+                    dist = Categorical(policy_output)
+                    action = dist.sample().item()
+                    log_prob = dist.log_prob(torch.tensor(action))
+                    
+                    # 计算状态值
+                    value = self.value(state_tensor)
+                
                 next_state, reward, done, _ = env.step(action)
                 episode_reward += reward
-                replay_buffer.append((state, action, log_prob, reward, next_state, done))
-                if len(replay_buffer) > buffer_size:
-                    replay_buffer.pop(0)
+                
+                # 存储整个转换（包括值估计和掩码）
+                episode_transitions.append({
+                    'state': state,
+                    'action': action,
+                    'log_prob': log_prob.item(),
+                    'reward': reward,
+                    'value': value.item(),
+                    'mask': action_mask.copy(),
+                    'done': done
+                })
                 state = next_state
                 t += 1
-
-            # 从经验回放池中采样数据
-            states, actions, old_log_probs, rewards, next_states, dones = zip(*replay_buffer)
-            returns = [0]
-            for i in reversed(range(len(rewards))):
-                returns.insert(0, rewards[i] + self.gamma * returns[0] * (1 - dones[i]))
-            returns = returns[:-1]
-            advantages = returns - np.array(values)
-            advantages = (advantages - np.mean(advantages)) / (np.std(advantages) + 1e-8)
-            weights = np.ones(len(states))
-
-            # 将数据分为小批量进行训练
-            for i in range(0, len(states), batch_size):
-                batch_indices = slice(i, i + batch_size)
-                self.train_step(
-                    states[batch_indices],
-                    actions[batch_indices],
-                    old_log_probs[batch_indices],
-                    returns[batch_indices],
-                    advantages[batch_indices],
-                    weights[batch_indices]
-                )
+            #visualization
+            running_reward = 0.05 * episode_reward + (1 - 0.05) * running_reward
+            running_length = 0.05 * t + (1 - 0.05) * running_length
+            progress_bar.set_postfix({
+                'Episode': f'{episode}/{num_episodes}',
+                'Reward': f'{episode_reward:.2f}',
+                'Avg Reward': f'{running_reward:.2f}',
+                'Best': f'{best_reward:.2f}',
+                'Length': f'{t}',
+                'Time': f'{time.time() - episode_start:.2f}s'
+            })
+            # 计算整个回合的回报和优势
+            returns = self.compute_returns(episode_transitions)
+            advantages = self.compute_advantages(episode_transitions, returns)
+            
+            # 将回合数据添加到回放缓冲区
+            for i, trans in enumerate(episode_transitions):
+                if len(replay_buffer) >= buffer_size:
+                    replay_buffer.pop(0)
+                replay_buffer.append({
+                    'state': trans['state'],
+                    'action': trans['action'],
+                    'old_log_prob': trans['log_prob'],
+                    'return': returns[i],
+                    'advantage': advantages[i],
+                    'mask': trans['mask']
+                })
+            
+            # 从回放缓冲区采样批次
+            if len(replay_buffer) >= batch_size:
+                indices = np.random.choice(len(replay_buffer), batch_size, replace=False)
+                batch = [replay_buffer[i] for i in indices]
+                
+                states = [item['state'] for item in batch]
+                actions = [item['action'] for item in batch]
+                old_log_probs = torch.tensor([item['old_log_prob'] for item in batch])
+                returns = [item['return'] for item in batch]
+                advantages = torch.tensor([item['advantage'] for item in batch])
+                masks = [item['mask'] for item in batch]
+                
+                self.train_step(states, actions, old_log_probs, returns, advantages, masks)
 
             print("Episode: {}, Reward: {}".format(episode, episode_reward))
 
-# 定义并训练麻将机器人
-class env_run():
-    def __init__(self,action_model):
-        self.action_model=action_model
 
-        self.memory=MahjonggMemory()
+    def compute_returns(self, transitions):
+        """计算折扣回报"""
+        returns = []
+        R = 0
+        for trans in reversed(transitions):
+            R = trans['reward'] + self.gamma * R * (1 - trans['done'])
+            returns.insert(0, R)
+        return returns
+
+    def compute_advantages(self, transitions, returns):
+        """计算优势函数"""
+        values = np.array([trans['value'] for trans in transitions])
+        advantages = returns - values
+        # 标准化优势
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        return advantages
+    
+
+# 定义并训练麻将机器人
+from collections import namedtuple
+
+class env_run():
+    def __init__(self, action_model, memory_size=10000):  # 添加 memory_size 参数
+        self.action_model = action_model
+
+        # 定义 observation_space 和 action_space
+        self.observation_space = namedtuple('Space', ['shape'])(shape=(117, 4, 9))  # 根据状态的维度调整
+        self.action_space = namedtuple('Space', ['n'])(n=235)  # 动作空间大小为 233+ 1 PASS
+
+        # 传递 memory_size 参数
+        self.memory = MahjonggMemory(max_size=memory_size)
         self.action_model.eval()
         self.reset()
 
     def reset(self):
         self.hand = np.zeros((4, 9, 1), dtype=np.int)
-        self.fulu=np.zreo((4,9,4),dtype=np.int)
-        self.discard=np.zero((4,9,112),dtype=np.int)
+        self.fulu = np.zeros((4, 9, 4), dtype=np.int)  # 修复拼写错误
+        self.discard = np.zeros((4, 9, 112), dtype=np.int)  # 修复拼写错误
         self.fan_count = 0
         self.turnID = 0
         self.tile_count = [21, 21, 21, 21]
@@ -428,13 +523,16 @@ class env_run():
         self.quan = 0
         self.prev_request = ''
         self.an_gang_card = ''
-        self.discardnumber=np.zeros((4,1),dtype=np.int)
+        self.discardnumber = np.zeros((4, 1), dtype=np.int)
         self.chownumber = np.zeros((4, 1), dtype=np.int)
         self.hand_fixed_data = []
-        self.state=[]
+        self.state = []
 
-
-
+        # 返回初始状态
+        # return np.concatenate([self.hand, self.fulu, self.discard], axis=2)
+        state = np.concatenate([self.hand, self.fulu, self.discard], axis=2)
+        state = np.transpose(state, (2, 0, 1))
+        return state
 
     def step(self, request=None, response_target=None, fname=None):
         if fname:
@@ -493,7 +591,7 @@ class env_run():
 
         # 第一轮，发牌
         if self.turnID == 1:
-            for i in range(5, 18):
+            for i in range(5, 17):
                 (cardname,cardid) = self.getcard(request[i])
                 j=0
                 while self.hand[cardname,cardid,j]!=0:
@@ -511,6 +609,11 @@ class env_run():
         return request
 
     def getcard(self, card):
+        if isinstance(card, (int, np.integer)):
+            card_type = card // 9  # 获取牌的类型
+            card_number = card % 9  # 获取牌的编号
+            print(f"Card: {card}, Card type: {card_type}, Card number: {card_number}")
+            return (card_type, card_number)
         if (cards[card[0]].value==4):
             return (cards[card[0]].value, int(card[1]) +3)
         return (cards[card[0]].value  ,int(card[1]) - 1)
@@ -521,7 +624,7 @@ class env_run():
         playerID = int(request[1])
         player_position = self.player_positions[playerID]
 
-        if requests(requestID) == requests.drawCard:
+        if requestID == 2:
             (cardname, cardid) = self.getcard(request[-1])
             j = 0
             while self.hand[cardname, cardid, j] != 0:
@@ -746,17 +849,34 @@ class env_run():
 
 
     def build_available_action_mask(self, request):
-        cardmask=np.zeros((4,9),dtype=int)
-        actionmask=np.zeros((234,1),dtype=int)
+        # print(f"Debug: Received request: {request}, type: {type(request)}")
+        # # 检查 request 是否有效
+        if request is None or not isinstance(request, (list, np.ndarray)) or len(request) == 0:
+            raise ValueError("Invalid request: request must be a non-empty list or array.")
 
-        requestID = int(request[0])
+        # 如果是 NumPy 数组，将其转换为列表
+        if isinstance(request, np.ndarray):
+            request = request.tolist()
+
+        # 如果 request 是嵌套列表，提取第一层的第一个元素
+        while isinstance(request[0], (list, np.ndarray)):
+            request = request[0]
+
+        try:
+            requestID = int(request[0])
+        except (ValueError, TypeError, IndexError):
+            raise ValueError(f"Invalid request[0]: {request[0]} cannot be converted to an integer.")
+
+        cardmask = np.zeros((4, 9), dtype=int)
+        actionmask = np.zeros(235, dtype=np.float32)
+
         playerID = int(request[1])
         myPlayerID = self.myPlayerID
 
         (last_card, lastcardid) = self.getcard(request[-1])
 
         # 摸牌回合
-        if requests(requestID) == requests.drawCard:
+        if requestID == 2:
 
             for i in range(3):
                 for j in range(8):
@@ -782,30 +902,29 @@ class env_run():
 
         else:
             #pass
-            actionmask[237] = 1
+            actionmask[234] = 1
             # 别人出牌
             if requests(requestID) in [requests.PENG, requests.CHI, requests.PLAY]:
                 if playerID != myPlayerID:
                     #判断碰，杠
                     a=0
                     for i in range(3):
-                        if self.hand[last_card, lastcardid,i]==1:
+                        if self.hand[last_card, lastcardid, i] == 1:
+                            a += 1
+                    if a == 3:
+                        actionmask[97 + 9 * last_card + lastcardid] = 1
 
-                            a+=1
-                    if(a==3):
-                        actionmask[97+9*last_card+lastcardid]=1
+                    if a == 2:
+                        actionmask[165 + 9 * last_card + lastcardid] = 1
+                    # 判断吃
+                    if last_card < 3:
+                        if lastcardid == 1:
+                            if self.hand[last_card, lastcardid + 1, 0] == 1 and self.hand[last_card, lastcardid + 2, 0] == 1:
+                                actionmask[34 + last_card * 21] = 1
 
-                    if (a == 2):
-                        actionmask[165+9*last_card+lastcardid]=1
-                    #判断吃
-                    if last_card<3:
-                        if lastcardid==1:
-                            if self.hand[last_card, lastcardid+1,0]==1 and self.hand[last_card, lastcardid+2,0]==1:
-                                actionmask[34+last_card*21]=1
-
-                        if lastcardid==9:
-                            if self.hand[last_card, lastcardid-1,0]==1 and self.hand[last_card, lastcardid-2,0]==1:
-                                actionmask[34+last_card*21]=1
+                        if lastcardid == 9:
+                            if self.hand[last_card, lastcardid - 1, 0] == 1 and self.hand[last_card, lastcardid - 2, 0] == 1:
+                                actionmask[34 + last_card * 21] = 1
 
                         if lastcardid==2:
                             if self.hand[last_card, lastcardid-1,0]==1 and self.hand[last_card, lastcardid+1,0]==1:
